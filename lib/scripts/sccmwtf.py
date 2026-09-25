@@ -9,7 +9,7 @@ from pyasn1.codec.der.decoder import decode
 from pyasn1_modules import rfc5652
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15, OAEP, MGF1
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
@@ -393,11 +393,35 @@ class SCCMTools():
         # Man.. asn1 suxx!
         content, rest = decode(result, asn1Spec=rfc5652.ContentInfo())
         content, rest = decode(content.getComponentByName('content'), asn1Spec=rfc5652.EnvelopedData())
-        encryptedRSAKey = content['recipientInfos'][0]['ktri']['encryptedKey'].asOctets()
-        iv = content['encryptedContentInfo']['contentEncryptionAlgorithm']['parameters'].asOctets()[2:]
-        body = content['encryptedContentInfo']['encryptedContent'].asOctets()
+        ktri = content['recipientInfos'][0]['ktri']
+        encryptedRSAKey = ktri['encryptedKey'].asOctets()
+        keyEncOID = str(ktri['keyEncryptionAlgorithm']['algorithm'])
+        encInfo = content['encryptedContentInfo']
+        contentEncOID = str(encInfo['contentEncryptionAlgorithm']['algorithm'])
+        iv = encInfo['contentEncryptionAlgorithm']['parameters'].asOctets()[2:]
+        body = encInfo['encryptedContent'].asOctets()
 
-        decrypted = CryptoTools.decrypt3Des(self.key, encryptedRSAKey, iv, body)
+        # Modern SCCM/MECM encrypts client policy with RSA-OAEP (1.2.840.113549.1.1.7)
+        # key transport + AES-CBC (2.16.840.1.101.3.4.1.*) content encryption. Older
+        # builds used RSA PKCS#1 v1.5 + 3DES-CBC; fall back to that path for them.
+        if keyEncOID == "1.2.840.113549.1.1.7":
+            sessionKey = None
+            for _h in (hashes.SHA256(), hashes.SHA1()):
+                try:
+                    sessionKey = self.key.decrypt(encryptedRSAKey, OAEP(mgf=MGF1(algorithm=_h), algorithm=_h, label=None))
+                    break
+                except Exception:
+                    continue
+            if sessionKey is None:
+                raise ValueError("[-] RSA-OAEP session-key decryption failed (tried SHA-256 and SHA-1)")
+            cipher = Cipher(algorithms.AES(sessionKey), modes.CBC(iv))
+            decryptor = cipher.decryptor()
+            decrypted = decryptor.update(body) + decryptor.finalize()
+            # strip PKCS#7 block padding
+            if decrypted and 1 <= decrypted[-1] <= 16:
+                decrypted = decrypted[:-decrypted[-1]]
+        else:
+            decrypted = CryptoTools.decrypt3Des(self.key, encryptedRSAKey, iv, body)
         policy = decrypted.decode('utf-16')
         return policy
     
